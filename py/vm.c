@@ -179,10 +179,8 @@
 #define TRACE_TICK(current_ip, current_sp, is_exception) do { \
     assert(code_state != code_state->prev_state); \
     assert(MP_STATE_THREAD(current_code_state) == code_state); \
-    if (!mp_prof_is_executing && code_state->frame && MP_STATE_THREAD(prof_trace_callback)) { \
-        MP_PROF_INSTR_DEBUG_PRINT(code_state->ip); \
-    } \
     if (!mp_prof_is_executing && code_state->frame && code_state->frame->callback) { \
+        MP_PROF_INSTR_DEBUG_PRINT(current_ip); \
         mp_prof_instr_tick(code_state, is_exception); \
     } \
 } while(0)
@@ -409,7 +407,6 @@ dispatch_loop:
                 }
 
                 ENTRY(MP_BC_LOAD_ATTR): {
-                    FRAME_UPDATE();
                     MARK_EXC_IP_SELECTIVE();
                     DECODE_QSTR;
                     mp_obj_t top = TOP();
@@ -490,7 +487,6 @@ dispatch_loop:
                 }
 
                 ENTRY(MP_BC_STORE_ATTR): {
-                    FRAME_UPDATE();
                     MARK_EXC_IP_SELECTIVE();
                     DECODE_QSTR;
                     mp_store_attr(sp[0], qst, sp[-1]);

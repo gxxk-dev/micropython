@@ -40,6 +40,9 @@ typedef struct _mp_obj_frame_t {
     struct _mp_obj_frame_t *back;
     mp_obj_t callback;
     mp_obj_code_t *code;
+    const byte *lineno_info;
+    mp_uint_t lineno_bc;
+    mp_uint_t lineno_source;
     mp_uint_t lasti;
     mp_uint_t lineno;
     bool trace_opcodes;

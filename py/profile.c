@@ -44,6 +44,42 @@ uint mp_prof_bytecode_lineno(const mp_raw_code_t *rc, size_t bc) {
     return mp_bytecode_get_source_line(prelude->line_info, prelude->line_info_top, bc);
 }
 
+static inline const mp_bytecode_prelude_t *mp_prof_frame_prelude(const mp_obj_frame_t *frame) {
+    return &frame->code->rc->prelude;
+}
+
+static void mp_prof_frame_lineno_cache_reset(mp_obj_frame_t *frame) {
+    const mp_bytecode_prelude_t *prelude = mp_prof_frame_prelude(frame);
+    frame->lineno_info = prelude->line_info;
+    frame->lineno_bc = 0;
+    frame->lineno_source = 1;
+}
+
+static mp_uint_t mp_prof_frame_lineno(mp_obj_frame_t *frame, size_t bc) {
+    if (frame->lineno_info == NULL || bc < frame->lineno_bc) {
+        mp_prof_frame_lineno_cache_reset(frame);
+    }
+
+    size_t bc_offset = bc - frame->lineno_bc;
+    const mp_bytecode_prelude_t *prelude = mp_prof_frame_prelude(frame);
+    const byte *line_info = frame->lineno_info;
+    while (line_info < prelude->line_info_top) {
+        const byte *line_info_next = line_info;
+        mp_code_lineinfo_t decoded = mp_bytecode_decode_lineinfo(&line_info_next);
+        if (bc_offset >= decoded.bc_increment) {
+            bc_offset -= decoded.bc_increment;
+            frame->lineno_bc += decoded.bc_increment;
+            frame->lineno_source += decoded.line_increment;
+            line_info = line_info_next;
+            frame->lineno_info = line_info;
+        } else {
+            break;
+        }
+    }
+
+    return frame->lineno_source;
+}
+
 void mp_prof_extract_prelude(const byte *bytecode, mp_bytecode_prelude_t *prelude) {
     const byte *ip = bytecode;
 
@@ -138,14 +174,15 @@ mp_obj_t mp_obj_new_frame(const mp_code_state_t *code_state) {
         return MP_OBJ_NULL;
     }
 
-    const mp_raw_code_t *rc = code->rc;
-    const mp_bytecode_prelude_t *prelude = &rc->prelude;
     o->code_state = code_state;
     o->base.type = &mp_type_frame;
     o->back = NULL;
     o->code = code;
-    o->lasti = code_state->ip - prelude->opcodes;
-    o->lineno = mp_prof_bytecode_lineno(rc, o->lasti);
+    o->lineno_info = NULL;
+    o->lineno_bc = 0;
+    o->lineno_source = 1;
+    o->lasti = code_state->ip - mp_prof_frame_prelude(o)->opcodes;
+    o->lineno = 0;
     o->trace_opcodes = false;
     o->callback = MP_OBJ_NULL;
 
@@ -162,19 +199,28 @@ typedef struct {
     mp_obj_t arg;
 } prof_callback_args_t;
 
-static mp_obj_t mp_prof_callback_invoke(mp_obj_t callback, prof_callback_args_t *args) {
+static mp_obj_t mp_prof_callback_call(mp_obj_t callback, prof_callback_args_t *args) {
     assert(mp_obj_is_callable(callback));
 
-    mp_prof_is_executing = true;
-
     mp_obj_t a[3] = {MP_OBJ_FROM_PTR(args->frame), args->event, args->arg};
-    mp_obj_t top = mp_call_function_n_kw(callback, 3, 0, a);
+    return mp_call_function_n_kw(callback, 3, 0, a);
+}
 
+static void mp_prof_callback_begin(void) {
+    mp_prof_is_executing = true;
+}
+
+static void mp_prof_callback_end(void) {
     mp_prof_is_executing = false;
-
     if (MP_STATE_THREAD(mp_pending_exception) != MP_OBJ_NULL) {
         mp_handle_pending(MP_HANDLE_PENDING_CALLBACKS_AND_EXCEPTIONS);
     }
+}
+
+static mp_obj_t mp_prof_callback_invoke(mp_obj_t callback, prof_callback_args_t *args) {
+    mp_prof_callback_begin();
+    mp_obj_t top = mp_prof_callback_call(callback, args);
+    mp_prof_callback_end();
     return top;
 }
 
@@ -200,11 +246,13 @@ mp_obj_t mp_prof_frame_enter(mp_code_state_t *code_state) {
         // We are entering not-yet-traced frame
         // which means it's a CALL event (not a GENERATOR)
         // so set the function definition line.
-        const mp_raw_code_t *rc = code_state->fun_bc->rc;
+        const mp_raw_code_t *rc = frame->code->rc;
         frame->lineno = rc->line_of_definition;
         if (!rc->line_of_definition) {
-            frame->lineno = mp_prof_bytecode_lineno(rc, 0);
+            frame->lineno = mp_prof_frame_lineno(frame, 0);
         }
+    } else {
+        frame->lineno = mp_prof_frame_lineno(frame, frame->lasti);
     }
     code_state->frame = frame;
 
@@ -237,14 +285,10 @@ mp_obj_t mp_prof_frame_update(const mp_code_state_t *code_state) {
     }
 
     mp_obj_frame_t *o = frame;
-    mp_obj_code_t *code = o->code;
-    const mp_raw_code_t *rc = code->rc;
-    const mp_bytecode_prelude_t *prelude = &rc->prelude;
-
     assert(o->code_state == code_state);
 
-    o->lasti = code_state->ip - prelude->opcodes;
-    o->lineno = mp_prof_bytecode_lineno(rc, o->lasti);
+    o->lasti = code_state->ip - mp_prof_frame_prelude(o)->opcodes;
+    o->lineno = mp_prof_frame_lineno(o, o->lasti);
 
     return MP_OBJ_FROM_PTR(o);
 }
@@ -258,13 +302,16 @@ mp_obj_t mp_prof_instr_tick(mp_code_state_t *code_state, bool is_exception) {
     // Detect data recursion
     assert(code_state != code_state->prev_state);
 
+    mp_obj_frame_t *frame = code_state->frame;
     mp_obj_t top = mp_const_none;
-    mp_obj_t callback = code_state->frame->callback;
+    mp_obj_t callback = frame->callback;
 
     prof_callback_args_t _args, *args = &_args;
-    args->frame = code_state->frame;
+    args->frame = frame;
     args->event = mp_const_none;
     args->arg = mp_const_none;
+
+    frame->lasti = code_state->ip - mp_prof_frame_prelude(frame)->opcodes;
 
     // Call event's are handled inside mp_prof_frame_enter
 
@@ -276,24 +323,33 @@ mp_obj_t mp_prof_instr_tick(mp_code_state_t *code_state, bool is_exception) {
     }
 
     // SETTRACE event LINE
-    const mp_raw_code_t *rc = code_state->fun_bc->rc;
-    const mp_bytecode_prelude_t *prelude = &rc->prelude;
-    size_t prev_line_no = args->frame->lineno;
-    size_t current_line_no = mp_prof_bytecode_lineno(rc, code_state->ip - prelude->opcodes);
-    if (prev_line_no != current_line_no) {
-        args->frame->lineno = current_line_no;
+    size_t prev_line_no = frame->lineno;
+    size_t current_line_no = mp_prof_frame_lineno(frame, frame->lasti);
+    bool emit_line = prev_line_no != current_line_no;
+    const byte *ip = code_state->ip;
+    bool emit_return = *ip == MP_BC_RETURN_VALUE || *ip == MP_BC_YIELD_VALUE;
+
+    if (emit_line || emit_return) {
+        mp_prof_callback_begin();
+    }
+
+    if (emit_line) {
+        frame->lineno = current_line_no;
         args->event = MP_OBJ_NEW_QSTR(MP_QSTR_line);
-        top = mp_prof_callback_invoke(callback, args);
+        top = mp_prof_callback_call(callback, args);
     }
 
     // SETTRACE event RETURN
-    const byte *ip = code_state->ip;
-    if (*ip == MP_BC_RETURN_VALUE || *ip == MP_BC_YIELD_VALUE) {
+    if (emit_return) {
         args->event = MP_OBJ_NEW_QSTR(MP_QSTR_return);
-        top = mp_prof_callback_invoke(callback, args);
+        top = mp_prof_callback_call(callback, args);
         if (code_state->prev_state && *ip == MP_BC_RETURN_VALUE) {
             code_state->frame->callback = MP_OBJ_NULL;
         }
+    }
+
+    if (emit_line || emit_return) {
+        mp_prof_callback_end();
     }
 
     // SETTRACE event OPCODE
